@@ -112,7 +112,29 @@ async def receive_whatsapp_message(request: Request):
                             
                             elif message.get("type") == "text":
                                 text_data = message.get("text", {})
-                                print(f"   💬 TEXT MESSAGE: {text_data.get('body')}")
+                                incoming_text = text_data.get('body', '').strip().lower()
+                                from_phone = message.get('from') # Meta sends format: 919876543210
+                                
+                                print(f"   💬 TEXT MESSAGE: {incoming_text}")
+                                
+                                # Check if the user is replying "yes" to verify
+                                if incoming_text == "yes":
+                                    print(f"   ✅ Verifying phone number for: {from_phone}")
+                                    try:
+                                        # Add the '+' back to match how Next.js saved it in the database
+                                        db_phone = f"+{from_phone}"
+                                        
+                                        # Update the client's status in Supabase
+                                        supabase_db.table("clients").update({"phone_verified": True}).eq("phone", db_phone).execute()
+                                        print("   💾 Database updated! Client is verified.")
+                                        
+                                        # Send a quick confirmation back to the shop owner
+                                        import asyncio
+                                        confirmation_msg = "Awesome! Your number is verified. You can now send invoice photos here. 📸"
+                                        asyncio.create_task(send_whatsapp_message(from_phone, confirmation_msg))
+                                        
+                                    except Exception as e:
+                                        print(f"   ❌ Failed to update verification status: {e}")
         
         # Always return 200 OK to Meta (they require this)
         return {"status": "ok"}
