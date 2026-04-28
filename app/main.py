@@ -3,10 +3,73 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 import httpx
 import os
+import re
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
 load_dotenv()
+
+
+# ============================================
+# PHONE NUMBER UTILITIES (BULLETPROOF)
+# ============================================
+def normalize_phone(phone: str) -> str:
+    """
+    Normalize any phone input to canonical format: +<digits>
+    Handles: spaces, dashes, parentheses, unicode whitespace, etc.
+    Examples:
+        '+91 8319494685'  -> '+918319494685'
+        '918319494685'    -> '+918319494685'
+        ' +91-8319-494685 ' -> '+918319494685'
+    """
+    if not phone:
+        return phone
+    # Strip ALL non-digit characters
+    digits = re.sub(r'\D', '', str(phone).strip())
+    if not digits:
+        return phone
+    return f'+{digits}'
+
+
+async def find_client_by_phone(phone_raw: str):
+    """
+    Robust client lookup that handles any phone format mismatch.
+    Tries: exact match with +digits, digits-only, and finally
+    a LIKE search on the last 10 digits as a fallback.
+    Returns the client dict or None.
+    """
+    normalized = normalize_phone(phone_raw)
+    digits = re.sub(r'\D', '', normalized)
+    last_10 = digits[-10:] if len(digits) >= 10 else digits
+
+    print(f"🔍 Looking up phone: raw='{phone_raw}' normalized='{normalized}' digits='{digits}' last10='{last_10}'")
+
+    # Attempt 1: Exact match with +digits (canonical format)
+    response = supabase.table("clients").select("*").eq("phone", normalized).execute()
+    if response.data:
+        print(f"✅ Found client via exact match: {response.data[0].get('name')}")
+        return response.data[0]
+
+    # Attempt 2: Exact match digits-only (no + sign)
+    response = supabase.table("clients").select("*").eq("phone", digits).execute()
+    if response.data:
+        print(f"✅ Found client via digits-only match: {response.data[0].get('name')}")
+        return response.data[0]
+
+    # Attempt 3: Fallback — LIKE search on last 10 digits
+    # This catches hidden whitespace, extra characters, etc.
+    response = supabase.table("clients").select("*").like("phone", f"%{last_10}%").execute()
+    if response.data:
+        print(f"✅ Found client via fuzzy last-10 match: {response.data[0].get('name')} (stored as '{response.data[0].get('phone')}')")
+        # Fix the stored phone to canonical format so future lookups are instant
+        stored_phone = response.data[0].get('phone', '')
+        if stored_phone != normalized:
+            print(f"🔧 Auto-fixing stored phone: '{stored_phone}' -> '{normalized}'")
+            supabase.table("clients").update({"phone": normalized}).eq("id", response.data[0]["id"]).execute()
+        return response.data[0]
+
+    print(f"❌ No client found for any variant of: {phone_raw}")
+    return None
 
 app = FastAPI(title="SmartBill AI Backend")
 
@@ -131,37 +194,31 @@ async def receive_whatsapp_message(request: Request):
 async def handle_verification(phone_number: str):
     """
     When client replies YES, mark them as verified
+    
+    Args:
+        phone_number: Format "919876543210" (no + sign, from WhatsApp)
     """
     try:
-        # 🛡️ DEFENSIVE FORMATTING: Strip hidden spaces, add + only if missing
-        clean_phone = str(phone_number).strip()
-        db_phone = clean_phone if clean_phone.startswith('+') else f"+{clean_phone}"
+        print(f"\n✅ Verification reply from: {phone_number}")
         
-        print(f"\n✅ Verification reply from: {db_phone}")
+        # Use robust phone lookup
+        client = await find_client_by_phone(phone_number)
         
-        # Find client by phone number
-        response = supabase.table("clients") \
-            .select("*") \
-            .eq("phone", db_phone) \
-            .execute()
-        
-        if not response.data or len(response.data) == 0:
-            print(f"⚠️  No client found with phone: {db_phone}")
-            print("💡 TIP: Check Supabase directly to ensure the number doesn't have hidden spaces saved in the row!")
-            
+        if not client:
+            # Clean phone for sending reply (digits only, no +)
+            clean_phone = re.sub(r'\D', '', str(phone_number))
             await send_whatsapp_message(
-                phone_number,
+                clean_phone,
                 "Sorry, I don't recognize this number. Please ask your CA to add you first."
             )
             return
         
-        client = response.data[0]
-        
         # Check if already verified
         if client.get("phone_verified"):
             print(f"ℹ️  Client already verified: {client['name']}")
+            clean_phone = re.sub(r'\D', '', str(phone_number))
             await send_whatsapp_message(
-                phone_number,
+                clean_phone,
                 f"Hi {client['name']}! You're already verified. Send me invoice photos anytime! 📸"
             )
             return
@@ -175,8 +232,9 @@ async def handle_verification(phone_number: str):
         print(f"✅ Client verified: {client['name']}")
         
         # Send confirmation
+        clean_phone = re.sub(r'\D', '', str(phone_number))
         await send_whatsapp_message(
-            phone_number,
+            clean_phone,
             f"""Perfect! ✅ Your number is now verified.
 
 Hi {client['name']}, you can now send your invoice photos directly here.
@@ -196,33 +254,31 @@ Try it now - send me an invoice photo! 📸"""
 async def handle_invoice_image(phone_number: str, image_id: str, mime_type: str):
     """
     Handle incoming invoice image
+    
+    Args:
+        phone_number: Format "919876543210" (from WhatsApp)
+        image_id: WhatsApp media ID
+        mime_type: Image MIME type
     """
     try:
-        # 🛡️ DEFENSIVE FORMATTING
-        clean_phone = str(phone_number).strip()
-        db_phone = clean_phone if clean_phone.startswith('+') else f"+{clean_phone}"
+        clean_phone = re.sub(r'\D', '', str(phone_number))
         
-        # Find client
-        response = supabase.table("clients") \
-            .select("*") \
-            .eq("phone", db_phone) \
-            .execute()
+        # Use robust phone lookup
+        client = await find_client_by_phone(phone_number)
         
-        if not response.data or len(response.data) == 0:
-            print(f"⚠️  Image from unknown number: {db_phone}")
+        if not client:
+            print(f"⚠️  Image from unknown number: {phone_number}")
             await send_whatsapp_message(
-                phone_number,
+                clean_phone,
                 "Please ask your CA to add your number to SmartBill AI first."
             )
             return
-        
-        client = response.data[0]
         
         # Check if verified
         if not client.get("phone_verified"):
             print(f"⚠️  Image from unverified client: {client['name']}")
             await send_whatsapp_message(
-                phone_number,
+                clean_phone,
                 "Please reply YES first to verify your number before sending invoices."
             )
             return
@@ -232,7 +288,7 @@ async def handle_invoice_image(phone_number: str, image_id: str, mime_type: str)
         # TODO: Download image, process with AI, save to database
         # For now, just acknowledge
         await send_whatsapp_message(
-            phone_number,
+            clean_phone,
             f"Got it! 📸 I'm processing your invoice now. You'll see it in your CA's dashboard shortly."
         )
         
@@ -300,8 +356,22 @@ async def send_welcome_message(request: Request):
         if not phone:
             raise HTTPException(status_code=400, detail="Phone number required")
         
-        # Remove + for API call
-        clean_phone = phone.replace("+", "")
+        # Normalize the phone and also fix it in the database
+        normalized = normalize_phone(phone)
+        print(f"📱 Welcome message - raw: '{phone}' normalized: '{normalized}'")
+        
+        # Update the stored phone to canonical format (fixes whitespace issues)
+        digits = re.sub(r'\D', '', normalized)
+        last_10 = digits[-10:] if len(digits) >= 10 else digits
+        response = supabase.table("clients").select("id, phone").like("phone", f"%{last_10}%").execute()
+        if response.data:
+            stored = response.data[0].get('phone', '')
+            if stored != normalized:
+                print(f"🔧 Fixing stored phone at welcome time: '{stored}' -> '{normalized}'")
+                supabase.table("clients").update({"phone": normalized}).eq("id", response.data[0]["id"]).execute()
+        
+        # Remove + for WhatsApp API call (expects digits only)
+        clean_phone = re.sub(r'\D', '', phone)
         
         message = f"""Hi {client_name}! 👋
 
