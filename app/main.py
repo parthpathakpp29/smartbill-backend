@@ -4,6 +4,7 @@ from fastapi.responses import PlainTextResponse
 import httpx
 import os
 from dotenv import load_dotenv
+from supabase import create_client, Client
 
 load_dotenv()
 
@@ -18,10 +19,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# WhatsApp API credentials from .env
+# WhatsApp API credentials
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
+
+# Supabase client
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 
 @app.get("/")
 def health_check():
@@ -38,28 +45,19 @@ def health_check():
 # ============================================
 @app.get("/webhooks/whatsapp")
 async def verify_webhook(request: Request):
-    """
-    Meta will call this endpoint with GET to verify the webhook.
-    We need to return the challenge if verify_token matches.
-    """
-    # Get query parameters
+    """Meta calls this to verify webhook"""
     mode = request.query_params.get("hub.mode")
     token = request.query_params.get("hub.verify_token")
     challenge = request.query_params.get("hub.challenge")
     
-    print(f"📞 Webhook verification request received")
-    print(f"   Mode: {mode}")
-    print(f"   Token: {token}")
-    print(f"   Challenge: {challenge}")
+    print(f"📞 Webhook verification request")
     
-    # Check if mode and token are correct
     if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
-        print("✅ Webhook verified successfully!")
-        # Return the challenge as plain text (Meta requires this)
+        print("✅ Webhook verified!")
         return PlainTextResponse(content=challenge)
     else:
-        print("❌ Verification failed - token mismatch")
-        raise HTTPException(status_code=403, detail="Verification token mismatch")
+        print("❌ Verification failed")
+        raise HTTPException(status_code=403, detail="Verification failed")
 
 
 # ============================================
@@ -67,94 +65,195 @@ async def verify_webhook(request: Request):
 # ============================================
 @app.post("/webhooks/whatsapp")
 async def receive_whatsapp_message(request: Request):
-    """
-    Meta will POST to this endpoint when:
-    - Someone sends a message to our WhatsApp number
-    - Message status updates (delivered, read, etc.)
-    """
+    """Receive messages from WhatsApp"""
     try:
         body = await request.json()
         print("\n" + "="*50)
-        print("📨 Received WhatsApp webhook!")
+        print("📨 WhatsApp webhook received")
         print("="*50)
-        print(f"Full payload: {body}")
         
-        # Check if this is a message event
-        if body.get("object") == "whatsapp_business_account":
-            entries = body.get("entry", [])
+        if body.get("object") != "whatsapp_business_account":
+            return {"status": "ok"}
+        
+        entries = body.get("entry", [])
+        
+        for entry in entries:
+            changes = entry.get("changes", [])
             
-            for entry in entries:
-                changes = entry.get("changes", [])
+            for change in changes:
+                value = change.get("value", {})
+                messages = value.get("messages", [])
                 
-                for change in changes:
-                    value = change.get("value", {})
+                if not messages:
+                    continue
+                
+                for message in messages:
+                    from_phone = message.get("from")  # Format: "919876543210"
+                    message_type = message.get("type")
                     
-                    # Check if there are messages
-                    messages = value.get("messages", [])
+                    print(f"\n📩 Message from: {from_phone}")
+                    print(f"   Type: {message_type}")
                     
-                    if messages:
-                        for message in messages:
-                            print("\n📩 NEW MESSAGE DETECTED:")
-                            print(f"   From: {message.get('from')}")
-                            print(f"   Type: {message.get('type')}")
-                            print(f"   Timestamp: {message.get('timestamp')}")
-                            
-                            # Check if it's an image
-                            if message.get("type") == "image":
-                                image_data = message.get("image", {})
-                                print(f"   📸 IMAGE RECEIVED!")
-                                print(f"      Image ID: {image_data.get('id')}")
-                                print(f"      MIME type: {image_data.get('mime_type')}")
-                                print(f"      Caption: {image_data.get('caption', 'No caption')}")
-                                
-                                # TODO: Download and process the image
-                                # We'll add this in the next step
-                            
-                            elif message.get("type") == "text":
-                                text_data = message.get("text", {})
-                                incoming_text = text_data.get('body', '').strip().lower()
-                                from_phone = message.get('from') # Meta sends format: 919876543210
-                                
-                                print(f"   💬 TEXT MESSAGE: {incoming_text}")
-                                
-                                # Check if the user is replying "yes" to verify
-                                if incoming_text == "yes":
-                                    print(f"   ✅ Verifying phone number for: {from_phone}")
-                                    try:
-                                        # Add the '+' back to match how Next.js saved it in the database
-                                        db_phone = f"+{from_phone}"
-                                        
-                                        # Update the client's status in Supabase
-                                        supabase_db.table("clients").update({"phone_verified": True}).eq("phone", db_phone).execute()
-                                        print("   💾 Database updated! Client is verified.")
-                                        
-                                        # Send a quick confirmation back to the shop owner
-                                        import asyncio
-                                        confirmation_msg = "Awesome! Your number is verified. You can now send invoice photos here. 📸"
-                                        asyncio.create_task(send_whatsapp_message(from_phone, confirmation_msg))
-                                        
-                                    except Exception as e:
-                                        print(f"   ❌ Failed to update verification status: {e}")
+                    # Handle TEXT messages (for verification)
+                    if message_type == "text":
+                        text_body = message.get("text", {}).get("body", "").strip().upper()
+                        print(f"   💬 Text: {text_body}")
+                        
+                        # Check if it's a verification response
+                        if text_body in ["YES", "Y", "CONFIRM", "OK"]:
+                            await handle_verification(from_phone)
+                    
+                    # Handle IMAGE messages (invoices)
+                    elif message_type == "image":
+                        image_data = message.get("image", {})
+                        image_id = image_data.get("id")
+                        mime_type = image_data.get("mime_type")
+                        caption = image_data.get("caption", "")
+                        
+                        print(f"   📸 Image ID: {image_id}")
+                        print(f"   📸 MIME: {mime_type}")
+                        print(f"   📸 Caption: {caption}")
+                        
+                        # TODO: Download and process invoice image
+                        # We'll add this in next step
+                        await handle_invoice_image(from_phone, image_id, mime_type)
         
-        # Always return 200 OK to Meta (they require this)
         return {"status": "ok"}
     
     except Exception as e:
-        print(f"❌ Error processing webhook: {str(e)}")
-        # Still return 200 to Meta (don't want them to retry forever)
+        print(f"❌ Webhook error: {str(e)}")
         return {"status": "error", "message": str(e)}
 
 
 # ============================================
-# SEND WHATSAPP MESSAGE (Helper Function)
+# HANDLE PHONE VERIFICATION
+# ============================================
+async def handle_verification(phone_number: str):
+    """
+    When client replies YES, mark them as verified
+    
+    Args:
+        phone_number: Format "919876543210" (no + sign)
+    """
+    try:
+        # Add + sign for database lookup
+        phone_with_plus = f"+{phone_number}"
+        
+        print(f"\n✅ Verification reply from: {phone_with_plus}")
+        
+        # Find client by phone number
+        response = supabase.table("clients") \
+            .select("*") \
+            .eq("phone", phone_with_plus) \
+            .execute()
+        
+        if not response.data or len(response.data) == 0:
+            print(f"⚠️  No client found with phone: {phone_with_plus}")
+            # Send message saying they're not registered
+            await send_whatsapp_message(
+                phone_number,
+                "Sorry, I don't recognize this number. Please ask your CA to add you first."
+            )
+            return
+        
+        client = response.data[0]
+        
+        # Check if already verified
+        if client.get("phone_verified"):
+            print(f"ℹ️  Client already verified: {client['name']}")
+            await send_whatsapp_message(
+                phone_number,
+                f"Hi {client['name']}! You're already verified. Send me invoice photos anytime! 📸"
+            )
+            return
+        
+        # Update to verified
+        supabase.table("clients") \
+            .update({"phone_verified": True}) \
+            .eq("id", client["id"]) \
+            .execute()
+        
+        print(f"✅ Client verified: {client['name']}")
+        
+        # Send confirmation
+        await send_whatsapp_message(
+            phone_number,
+            f"""Perfect! ✅ Your number is now verified.
+
+Hi {client['name']}, you can now send your invoice photos directly here.
+
+Just snap a clear photo of any invoice and send it to me. I'll extract all the details automatically!
+
+Try it now - send me an invoice photo! 📸"""
+        )
+        
+    except Exception as e:
+        print(f"❌ Verification error: {str(e)}")
+
+
+# ============================================
+# HANDLE INVOICE IMAGE
+# ============================================
+async def handle_invoice_image(phone_number: str, image_id: str, mime_type: str):
+    """
+    Handle incoming invoice image
+    
+    Args:
+        phone_number: Format "919876543210"
+        image_id: WhatsApp media ID
+        mime_type: Image MIME type
+    """
+    try:
+        phone_with_plus = f"+{phone_number}"
+        
+        # Find client
+        response = supabase.table("clients") \
+            .select("*") \
+            .eq("phone", phone_with_plus) \
+            .execute()
+        
+        if not response.data or len(response.data) == 0:
+            print(f"⚠️  Image from unknown number: {phone_with_plus}")
+            await send_whatsapp_message(
+                phone_number,
+                "Please ask your CA to add your number to SmartBill AI first."
+            )
+            return
+        
+        client = response.data[0]
+        
+        # Check if verified
+        if not client.get("phone_verified"):
+            print(f"⚠️  Image from unverified client: {client['name']}")
+            await send_whatsapp_message(
+                phone_number,
+                "Please reply YES first to verify your number before sending invoices."
+            )
+            return
+        
+        print(f"📸 Processing invoice from verified client: {client['name']}")
+        
+        # TODO: Download image, process with AI, save to database
+        # For now, just acknowledge
+        await send_whatsapp_message(
+            phone_number,
+            f"Got it! 📸 I'm processing your invoice now. You'll see it in your CA's dashboard shortly."
+        )
+        
+    except Exception as e:
+        print(f"❌ Image handling error: {str(e)}")
+
+
+# ============================================
+# SEND WHATSAPP MESSAGE
 # ============================================
 async def send_whatsapp_message(to_phone: str, message_text: str):
     """
-    Send a text message via WhatsApp Cloud API
+    Send WhatsApp message
     
     Args:
-        to_phone: Phone number in format "919876543210" (no + sign)
-        message_text: The message to send
+        to_phone: "919876543210" (NO + sign)
+        message_text: Message content
     """
     url = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
     
@@ -167,50 +266,54 @@ async def send_whatsapp_message(to_phone: str, message_text: str):
         "messaging_product": "whatsapp",
         "to": to_phone,
         "type": "text",
-        "text": {
-            "body": message_text
-        }
+        "text": {"body": message_text}
     }
+    
+    print(f"\n📤 Sending WhatsApp to: {to_phone}")
     
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
             
-            print(f"✅ WhatsApp message sent to {to_phone}")
+            print(f"   Status: {response.status_code}")
+            
+            if response.status_code != 200:
+                error_body = response.text
+                print(f"   ❌ Error: {error_body}")
+                raise Exception(f"WhatsApp API error: {error_body}")
+            
+            print(f"   ✅ Message sent!")
             return response.json()
     
     except Exception as e:
-        print(f"❌ Failed to send WhatsApp: {str(e)}")
+        print(f"❌ Send failed: {str(e)}")
         raise
 
 
 # ============================================
-# API ENDPOINT: Send Welcome Message
+# API: SEND WELCOME MESSAGE
 # ============================================
 @app.post("/api/send-welcome")
 async def send_welcome_message(request: Request):
-    """
-    Called by Next.js frontend when CA adds a new client.
-    Sends a welcome message to the client's WhatsApp.
-    """
+    """Send welcome message to new client"""
     try:
         data = await request.json()
         phone = data.get("phone")  # Format: "+919876543210"
         client_name = data.get("client_name", "there")
         
-        # Remove + sign from phone (Meta API doesn't want it)
+        if not phone:
+            raise HTTPException(status_code=400, detail="Phone number required")
+        
+        # Remove + for API call
         clean_phone = phone.replace("+", "")
         
         message = f"""Hi {client_name}! 👋
 
 You've been added to SmartBill AI by your CA.
 
-From now on, you can send your invoice photos directly to this WhatsApp number, and we'll automatically extract the data for your accountant.
+From now on, send your invoice photos directly here, and I'll automatically extract the details.
 
-Just send a clear photo of any invoice, and we'll handle the rest!
-
-Reply YES to confirm you received this message."""
+📸 Reply YES to verify your number and get started!"""
         
         result = await send_whatsapp_message(clean_phone, message)
         
@@ -220,5 +323,5 @@ Reply YES to confirm you received this message."""
         }
     
     except Exception as e:
-        print(f"❌ Error in send_welcome_message: {str(e)}")
+        print(f"❌ Welcome message error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
