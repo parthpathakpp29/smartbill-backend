@@ -131,25 +131,24 @@ async def receive_whatsapp_message(request: Request):
 async def handle_verification(phone_number: str):
     """
     When client replies YES, mark them as verified
-    
-    Args:
-        phone_number: Format "919876543210" (no + sign)
     """
     try:
-        # Add + sign for database lookup
-        phone_with_plus = f"+{phone_number}"
+        # 🛡️ DEFENSIVE FORMATTING: Strip hidden spaces, add + only if missing
+        clean_phone = str(phone_number).strip()
+        db_phone = clean_phone if clean_phone.startswith('+') else f"+{clean_phone}"
         
-        print(f"\n✅ Verification reply from: {phone_with_plus}")
+        print(f"\n✅ Verification reply from: {db_phone}")
         
         # Find client by phone number
         response = supabase.table("clients") \
             .select("*") \
-            .eq("phone", phone_with_plus) \
+            .eq("phone", db_phone) \
             .execute()
         
         if not response.data or len(response.data) == 0:
-            print(f"⚠️  No client found with phone: {phone_with_plus}")
-            # Send message saying they're not registered
+            print(f"⚠️  No client found with phone: {db_phone}")
+            print("💡 TIP: Check Supabase directly to ensure the number doesn't have hidden spaces saved in the row!")
+            
             await send_whatsapp_message(
                 phone_number,
                 "Sorry, I don't recognize this number. Please ask your CA to add you first."
@@ -197,23 +196,20 @@ Try it now - send me an invoice photo! 📸"""
 async def handle_invoice_image(phone_number: str, image_id: str, mime_type: str):
     """
     Handle incoming invoice image
-    
-    Args:
-        phone_number: Format "919876543210"
-        image_id: WhatsApp media ID
-        mime_type: Image MIME type
     """
     try:
-        phone_with_plus = f"+{phone_number}"
+        # 🛡️ DEFENSIVE FORMATTING
+        clean_phone = str(phone_number).strip()
+        db_phone = clean_phone if clean_phone.startswith('+') else f"+{clean_phone}"
         
         # Find client
         response = supabase.table("clients") \
             .select("*") \
-            .eq("phone", phone_with_plus) \
+            .eq("phone", db_phone) \
             .execute()
         
         if not response.data or len(response.data) == 0:
-            print(f"⚠️  Image from unknown number: {phone_with_plus}")
+            print(f"⚠️  Image from unknown number: {db_phone}")
             await send_whatsapp_message(
                 phone_number,
                 "Please ask your CA to add your number to SmartBill AI first."
