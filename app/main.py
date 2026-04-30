@@ -271,26 +271,6 @@ async def handle_invoice_image(phone_number: str, image_id: str, mime_type: str)
             )
         
 
-        result = supabase.table("invoices").insert(invoice_row).execute()
-
-        if not result.data:
-            raise Exception("Failed to create invoice placeholder row")
-
-        invoice_id = result.data[0]["id"]
-        print(f"   📋 Created invoice placeholder: {invoice_id}")
-
-        # ── Phase 2: Hand off to BackgroundTasks ──
-        background_tasks.add_task(
-            process_invoice_background,
-            invoice_id=invoice_id,
-            client=client,
-            phone_number=phone_number,
-            image_id=image_id,
-            mime_type=mime_type,
-        )
-
-        print(f"   🚀 Background task queued! Returning 200 to Meta immediately.")
-
     except Exception as e:
         print(f"❌ Invoice handler error: {str(e)}")
         # Still try to notify the user
