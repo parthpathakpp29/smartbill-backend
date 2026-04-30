@@ -14,6 +14,7 @@ from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 import re
+from datetime import datetime, timezone
 
 from app.config import supabase, WHATSAPP_VERIFY_TOKEN
 from app.utils.phone import normalize_phone, get_clean_digits, find_client_by_phone
@@ -235,10 +236,10 @@ async def handle_invoice_image(phone_number: str, image_id: str, mime_type: str)
         
         print(f"Processing invoice from verified client: {client['name']}")
         
-        # Create a basic invoice entry in database
+        # Create a basic invoice entry in database first
         invoice_data = {
             "client_id": client["id"],
-            "vendor_name": "WhatsApp Invoice",
+            "vendor_name": "Processing...",
             "invoice_number": f"WA-{image_id[:8]}",
             "invoice_date": None,
             "total_amount": None,
@@ -251,18 +252,64 @@ async def handle_invoice_image(phone_number: str, image_id: str, mime_type: str)
             "created_at": None,  # Will be set by database
             "processed_at": None
         }
-        
+
         # Save to database
         result = supabase.table("invoices").insert(invoice_data).execute()
-        
+
         if result.data:
             invoice_id = result.data[0]["id"]
             print(f"Created invoice entry: {invoice_id}")
             
-            await send_whatsapp_message(
-                phone_number,
-                f"Got it! I've saved your invoice (ID: {invoice_id[:8]}). Your CA can see it in their dashboard now."
-            )
+            # Now process the image in background
+            try:
+                # Download image from WhatsApp
+                from app.services.whatsapp import download_media
+                image_bytes, actual_mime = await download_media(image_id)
+                print(f"Downloaded image: {len(image_bytes)} bytes")
+
+                # Process with Gemini AI
+                from app.services.gemini import extract_invoice_data
+                extracted = await extract_invoice_data(image_bytes, actual_mime or mime_type)
+                print(f"Extracted data: {extracted}")
+
+                # Update invoice with extracted data
+                update_data = {
+                    "vendor_name": extracted.get("vendor_name", "Unknown Vendor"),
+                    "invoice_number": extracted.get("invoice_number", f"WA-{image_id[:8]}"),
+                    "invoice_date": extracted.get("invoice_date"),
+                    "total_amount": extracted.get("total_amount"),
+                    "tax_amount": extracted.get("tax_amount"),
+                    "payment_method": extracted.get("payment_method"),
+                    "status": "completed" if extracted.get("confidence", 0) > 0.5 else "needs_review",
+                    "confidence_score": extracted.get("confidence", 0.0),
+                    "extracted_data": extracted,
+                    "processed_at": datetime.now(timezone.utc).isoformat()
+                }
+
+                # Clean None values
+                update_data = {k: v for k, v in update_data.items() if v is not None}
+
+                supabase.table("invoices").update(update_data).eq("id", invoice_id).execute()
+                print(f"Updated invoice with extracted data")
+
+                await send_whatsapp_message(
+                    phone_number,
+                    f"Got it! I've processed your invoice (ID: {invoice_id[:8]}). Your CA can see it in their dashboard now."
+                )
+
+            except Exception as processing_error:
+                print(f"Processing error: {str(processing_error)}")
+                # Update with error status
+                supabase.table("invoices").update({
+                    "status": "needs_review",
+                    "processing_error": str(processing_error)[:500],
+                    "processed_at": datetime.now(timezone.utc).isoformat()
+                }).eq("id", invoice_id).execute()
+
+                await send_whatsapp_message(
+                    phone_number,
+                    f"Got your invoice (ID: {invoice_id[:8]})! I had some trouble reading it, but your CA will review it manually."
+                )
         else:
             print("Failed to create invoice entry")
             await send_whatsapp_message(
